@@ -35,6 +35,7 @@ func main() {
 
 	if *sTime == "" {
 		fmt.Println("Start time must be set with command line argument")
+		flag.Usage()
 		return
 	}
 
