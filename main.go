@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-const DatetimeFormat = "2006-01-02T15:04:05"
-const LogSliceMaxCapacity = 500
+const datetimeFormat = "2006-01-02T15:04:05"
+const logSliceMaxCapacity = 500
 
 func parseDateTime(t0 *string) (*time.Time, error) {
-	parsed, err := time.Parse(DatetimeFormat, *t0)
+	parsed, err := time.Parse(datetimeFormat, *t0)
 	if err != nil {
 		return nil, err
 	}
@@ -87,14 +87,14 @@ func main() {
 		if eventsLen == 0 {
 			return true
 		}
-		for j := 0; j <= eventsLen/LogSliceMaxCapacity; j++ {
+		for j := 0; j <= eventsLen/logSliceMaxCapacity; j++ {
 			var records []*kinesis.PutRecordsRequestEntry
-			var sliceEnd = j*LogSliceMaxCapacity + LogSliceMaxCapacity
+			var sliceEnd = j*logSliceMaxCapacity + logSliceMaxCapacity
 			if sliceEnd > eventsLen {
 				sliceEnd = eventsLen
 			}
 			var buf bytes.Buffer
-			for i, event := range filteredEvents.Events[j*LogSliceMaxCapacity : sliceEnd] {
+			for i, event := range filteredEvents.Events[j*logSliceMaxCapacity : sliceEnd] {
 				buf.Reset()
 				com := gzip.NewWriter(&buf)
 				_, err := com.Write([]byte(*event.Message))
