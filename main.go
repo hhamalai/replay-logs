@@ -3,25 +3,173 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go/service/kinesis"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"os"
 	"time"
 )
 
-const datetimeFormat = "2006-01-02T15:04:05"
-const logSliceMaxCapacity = 500
+const datetimeFormat = "2006-01-02 15:04:05"
 
 func parseDateTime(t0 *string) (*time.Time, error) {
-	parsed, err := time.Parse(datetimeFormat, *t0)
+	t, _ := time.LoadLocation("UTC")
+	parsed, err := time.ParseInLocation(datetimeFormat, *t0, t)
 	if err != nil {
 		return nil, err
 	}
 	return &parsed, nil
+}
+
+// Cloudwatch Log event
+type LogEvent struct {
+	ID        string `json:"id"`
+	Timestamp int64  `json:"timestamp"`
+	Message   string `json:"message"`
+}
+
+// CloudWatch Log group subscription filtered format to Kinesis
+type Record struct {
+	Owner               string      `json:"owner"`
+	LogGroup            string      `json:"logGroup"`
+	LogStream           string      `json:"logStream"`
+	SubscriptionFilters []string    `json:"subscriptionFilters"`
+	MessageType         string      `json:"messageType"`
+	LogEvents           []*LogEvent `json:"logEvents"`
+}
+
+
+type TimedBytes struct {
+	ts time.Time
+	bytes int
+}
+
+// TimedMetric compute rolling window averages (e.g. bytes/sec)
+type TimedMetric struct {
+	measurements []TimedBytes
+	windowSize time.Duration
+}
+
+// Prune measurements not in the window
+func (tm *TimedMetric) Prune(t time.Time) {
+	if len(tm.measurements) > 0 {
+		for i, measurement := range tm.measurements {
+			if measurement.ts.After(t.Add(-tm.windowSize)) {
+				tm.measurements = tm.measurements[i:]
+				break
+			}
+		}
+	}
+}
+
+// Add prunes and adds value with current timestamp
+func (tm *TimedMetric) Add(bytes int) {
+	t := time.Now()
+	tm.Prune(t)
+	tm.measurements = append(tm.measurements, TimedBytes{
+		ts:    t,
+		bytes: bytes,
+	})
+}
+
+// Value prunes and returns current formatted value
+func (tm *TimedMetric) Value() (int, string) {
+	t := time.Now()
+	tm.Prune(t)
+	var totalBytes = 0
+
+	for _, measurement := range tm.measurements {
+		totalBytes += measurement.bytes
+	}
+	bs := totalBytes
+
+	var result = fmt.Sprintf("%d B/s", totalBytes)
+
+	if totalBytes >= 1000 {
+		totalBytes /= 1000
+		result = fmt.Sprintf("%d kB/s", totalBytes)
+	}
+
+	if totalBytes >= 1000 {
+		totalBytes /= 1000
+		result = fmt.Sprintf("%d MB/s", totalBytes)
+	}
+
+	return bs, result
+}
+
+func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsRequestEntry, kinesisStream *string, tm *TimedMetric) {
+	var bytesSent = 0
+	for _, record := range records {
+		bytesSent += len(record.Data)
+	}
+	tm.Add(bytesSent)
+	bs, output := tm.Value()
+	if bs >= 650000 {
+		time.Sleep(time.Millisecond*100)
+	}
+	results, _ := kinesisSvc.PutRecords(&kinesis.PutRecordsInput{
+		Records:    records,
+		StreamName: kinesisStream,
+	})
+
+	var backOff = time.Second
+	var err error
+	for ; *results.FailedRecordCount != 0 ; {
+		_, output = tm.Value()
+		fmt.Printf("Some records (%d/%d) failed: %s retrying in %f seconds (%s)\n", *results.FailedRecordCount, len(records), err, backOff.Seconds(), output)
+		time.Sleep(backOff)
+		bytesSent = 0
+		if backOff < 128 * time.Second {
+			backOff *= 2
+		}
+		var toRetry []*kinesis.PutRecordsRequestEntry
+
+		for i, result := range results.Records {
+			if result.ErrorCode != nil {
+				toRetry = append(toRetry, records[i])
+			}
+		}
+
+		for _, record := range records {
+			bytesSent += len(record.Data)
+		}
+
+		tm.Add(bytesSent)
+		results, err = kinesisSvc.PutRecords(&kinesis.PutRecordsInput{
+			Records:    records,
+			StreamName: kinesisStream,
+		})
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
+}
+
+// Partition list of log events into lists of of logevents, each holding at maximum bytes
+func splitLogEvents(logEvents []*LogEvent, bytesPerSlice int) [][]*LogEvent {
+	var bts = 0
+	result := make([][]*LogEvent, 0)
+	var prevSliceStart = 0
+	if len(logEvents) == 0 {
+		return nil
+	}
+	for i, event := range logEvents {
+		curEventSize := len(event.ID) + len(event.Message) + 8 // len(event.ID) + len(event.Message) + len(event.Timestamp)
+		if bts + curEventSize >= bytesPerSlice {
+			result = append(result, logEvents[prevSliceStart:i])
+			prevSliceStart = i
+			bts = 0
+		}
+		bts += curEventSize
+	}
+	result = append(result, logEvents[prevSliceStart:])
+	return result
 }
 
 func main() {
@@ -73,7 +221,20 @@ func main() {
 
 	cloudwatchSvc := cloudwatchlogs.New(mySession, config)
 	kinesisSvc := kinesis.New(mySession, config)
+	stsSvc := sts.New(mySession, config)
 
+	result, err := stsSvc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+
+	if err != nil {
+		println(err)
+		return
+	}
+	accountID := *result.Account
+
+	tm := TimedMetric{
+		measurements: make([]TimedBytes, 0),
+		windowSize:   time.Second,
+	}
 
 	fmt.Println("################ Starting replay ################")
 	err = cloudwatchSvc.FilterLogEventsPages(&cloudwatchlogs.FilterLogEventsInput{
@@ -82,47 +243,68 @@ func main() {
 		StartTime:     startTime,
 		EndTime:       endTime,
 	}, func(filteredEvents *cloudwatchlogs.FilterLogEventsOutput, lastPage bool) bool {
+		eventsByStream := make(map[string][]*LogEvent, 1)
 		events := filteredEvents.Events
 		eventsLen := len(events)
+
+		// There may be outputs without any events when no log events are produced within the CW "index period"
 		if eventsLen == 0 {
 			return true
 		}
-		for j := 0; j <= eventsLen/logSliceMaxCapacity; j++ {
-			var records []*kinesis.PutRecordsRequestEntry
-			var sliceEnd = j*logSliceMaxCapacity + logSliceMaxCapacity
-			if sliceEnd > eventsLen {
-				sliceEnd = eventsLen
+
+
+		// Sort messages by log stream, so that they can be published into Kinesis stream in a single batch by stream
+		for i, event := range filteredEvents.Events {
+			if i == 0 {
+				_, value := tm.Value()
+				fmt.Println("Processing messages from", time.Unix(*event.Timestamp/1000, 0).UTC(), value)
 			}
-			var buf bytes.Buffer
-			for i, event := range filteredEvents.Events[j*logSliceMaxCapacity : sliceEnd] {
-				buf.Reset()
+			eventsByStream[*event.LogStreamName] = append(eventsByStream[*event.LogStreamName], &LogEvent{
+				ID:        *event.EventId,
+				Timestamp: *event.Timestamp,
+				Message:   *event.Message,
+			})
+		}
+
+		var records []*kinesis.PutRecordsRequestEntry
+		for stream, streamEvents := range eventsByStream {
+			for i, events := range splitLogEvents(streamEvents, 600000) {
+				println("Publishing to stream", stream, "batch #", i, "items", len(events))
+				record := Record{
+					Owner:               accountID,
+					LogGroup:            *logGroup,
+					LogStream:           stream,
+					SubscriptionFilters: append(make([]string, 0), "kinesis_logfilter_0"),
+					MessageType:         "DATA_MESSAGE",
+					LogEvents:           events,
+				}
+				encodedRecords, err := json.Marshal(record)
+				if err != nil {
+					fmt.Println(err)
+					return false
+				}
+				var buf bytes.Buffer
+
 				com := gzip.NewWriter(&buf)
-				_, err := com.Write([]byte(*event.Message))
+
+				_, err = com.Write(encodedRecords)
 				if err != nil {
 					fmt.Println(err)
 					return false
 				}
 				err = com.Close()
+
 				if err != nil {
 					fmt.Println(err)
 					return false
 				}
-				if i == 0 {
-					fmt.Println("Processing messages from", time.Unix(*event.Timestamp/1000, 0))
-				}
+
 				records = append(records, &kinesis.PutRecordsRequestEntry{
 					Data:         buf.Bytes(),
-					PartitionKey: event.LogStreamName,
+					PartitionKey: &stream,
 				})
-			}
 
-			_, err := kinesisSvc.PutRecords(&kinesis.PutRecordsInput{
-				Records:    records,
-				StreamName: kinesisStream,
-			})
-			if err != nil {
-				fmt.Printf("Failed to publish logs to Kinesis: %v\n", err)
-				return false
+				sendRecords(kinesisSvc, records, kinesisStream, &tm)
 			}
 		}
 		return true
