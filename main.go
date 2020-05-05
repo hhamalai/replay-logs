@@ -17,13 +17,9 @@ import (
 
 const datetimeFormat = "2006-01-02 15:04:05"
 
-func parseDateTime(t0 *string) (*time.Time, error) {
+func parseDateTime(t0 *string) (time.Time, error) {
 	t, _ := time.LoadLocation("UTC")
-	parsed, err := time.ParseInLocation(datetimeFormat, *t0, t)
-	if err != nil {
-		return nil, err
-	}
-	return &parsed, nil
+	return time.ParseInLocation(datetimeFormat, *t0, t)
 }
 
 // Cloudwatch Log event
@@ -40,67 +36,7 @@ type Record struct {
 	LogStream           string      `json:"logStream"`
 	SubscriptionFilters []string    `json:"subscriptionFilters"`
 	MessageType         string      `json:"messageType"`
-	LogEvents           []*LogEvent `json:"logEvents"`
-}
-
-
-type TimedBytes struct {
-	ts time.Time
-	bytes int
-}
-
-// TimedMetric compute rolling window averages (e.g. bytes/sec)
-type TimedMetric struct {
-	measurements []TimedBytes
-	windowSize time.Duration
-}
-
-// Prune measurements not in the window
-func (tm *TimedMetric) Prune(t time.Time) {
-	if len(tm.measurements) > 0 {
-		for i, measurement := range tm.measurements {
-			if measurement.ts.After(t.Add(-tm.windowSize)) {
-				tm.measurements = tm.measurements[i:]
-				break
-			}
-		}
-	}
-}
-
-// Add prunes and adds value with current timestamp
-func (tm *TimedMetric) Add(bytes int) {
-	t := time.Now()
-	tm.Prune(t)
-	tm.measurements = append(tm.measurements, TimedBytes{
-		ts:    t,
-		bytes: bytes,
-	})
-}
-
-// Value prunes and returns current formatted value
-func (tm *TimedMetric) Value() (int, string) {
-	t := time.Now()
-	tm.Prune(t)
-	var totalBytes = 0
-
-	for _, measurement := range tm.measurements {
-		totalBytes += measurement.bytes
-	}
-	bs := totalBytes
-
-	var result = fmt.Sprintf("%d B/s", totalBytes)
-
-	if totalBytes >= 1000 {
-		totalBytes /= 1000
-		result = fmt.Sprintf("%d kB/s", totalBytes)
-	}
-
-	if totalBytes >= 1000 {
-		totalBytes /= 1000
-		result = fmt.Sprintf("%d MB/s", totalBytes)
-	}
-
-	return bs, result
+	LogEvents           []LogEvent `json:"logEvents"`
 }
 
 func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsRequestEntry, kinesisStream *string, tm *TimedMetric) {
@@ -152,9 +88,9 @@ func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsReque
 }
 
 // Partition list of log events into lists of of logevents, each holding at maximum bytes
-func splitLogEvents(logEvents []*LogEvent, bytesPerSlice int) [][]*LogEvent {
+func splitLogEvents(logEvents []LogEvent, bytesPerSlice int) [][]LogEvent {
 	var bts = 0
-	result := make([][]*LogEvent, 0)
+	result := make([][]LogEvent, 0)
 	var prevSliceStart = 0
 	if len(logEvents) == 0 {
 		return nil
@@ -184,14 +120,14 @@ func main() {
 	if *sTime == "" {
 		fmt.Println("Start time must be set with command line argument")
 		flag.Usage()
-		return
+		os.Exit(1)
 	}
 
 	var startTime *int64 = nil
 	e0, err := parseDateTime(sTime)
 	if err != nil {
 		fmt.Println(err)
-		return
+		os.Exit(1)
 	}
 	startTime = aws.Int64(e0.Unix() * 1000)
 
@@ -200,7 +136,7 @@ func main() {
 		e0, err := parseDateTime(eTime)
 		if err != nil {
 			fmt.Println(err)
-			return
+			os.Exit(1)
 		}
 		endTime = aws.Int64(e0.Unix() * 1000)
 	}
@@ -226,8 +162,8 @@ func main() {
 	result, err := stsSvc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
 
 	if err != nil {
-		println(err)
-		return
+		fmt.Println(err)
+		os.Exit(1)
 	}
 	accountID := *result.Account
 
@@ -243,7 +179,7 @@ func main() {
 		StartTime:     startTime,
 		EndTime:       endTime,
 	}, func(filteredEvents *cloudwatchlogs.FilterLogEventsOutput, lastPage bool) bool {
-		eventsByStream := make(map[string][]*LogEvent, 1)
+		eventsByStream := make(map[string][]LogEvent, 0)
 		events := filteredEvents.Events
 		eventsLen := len(events)
 
@@ -259,7 +195,7 @@ func main() {
 				_, value := tm.Value()
 				fmt.Println("Processing messages from", time.Unix(*event.Timestamp/1000, 0).UTC(), value)
 			}
-			eventsByStream[*event.LogStreamName] = append(eventsByStream[*event.LogStreamName], &LogEvent{
+			eventsByStream[*event.LogStreamName] = append(eventsByStream[*event.LogStreamName], LogEvent{
 				ID:        *event.EventId,
 				Timestamp: *event.Timestamp,
 				Message:   *event.Message,
@@ -269,12 +205,12 @@ func main() {
 		var records []*kinesis.PutRecordsRequestEntry
 		for stream, streamEvents := range eventsByStream {
 			for i, events := range splitLogEvents(streamEvents, 600000) {
-				println("Publishing to stream", stream, "batch #", i, "items", len(events))
+				fmt.Println("Publishing to stream", stream, "batch #", i, "items", len(events))
 				record := Record{
 					Owner:               accountID,
 					LogGroup:            *logGroup,
 					LogStream:           stream,
-					SubscriptionFilters: append(make([]string, 0), "kinesis_logfilter_0"),
+					SubscriptionFilters: []string{"kinesis_logfilter_0"},
 					MessageType:         "DATA_MESSAGE",
 					LogEvents:           events,
 				}
@@ -287,13 +223,12 @@ func main() {
 
 				com := gzip.NewWriter(&buf)
 
-				_, err = com.Write(encodedRecords)
-				if err != nil {
+				_, err = com.Write(encodedRecords); if err != nil {
 					fmt.Println(err)
 					return false
 				}
-				err = com.Close()
 
+				err = com.Close();
 				if err != nil {
 					fmt.Println(err)
 					return false
@@ -312,5 +247,6 @@ func main() {
 
 	if err != nil {
 		fmt.Printf("Log replay failed: %s\n", err)
+		os.Exit(1)
 	}
 }
