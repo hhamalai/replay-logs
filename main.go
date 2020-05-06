@@ -39,7 +39,7 @@ type Record struct {
 	LogEvents           []LogEvent `json:"logEvents"`
 }
 
-func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsRequestEntry, kinesisStream *string, tm *TimedMetric) {
+func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsRequestEntry, kinesisStream *string, tm *TimedMetric) error {
 	var bytesSent = 0
 	for _, record := range records {
 		bytesSent += len(record.Data)
@@ -49,13 +49,16 @@ func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsReque
 	if bs >= 650000 {
 		time.Sleep(time.Millisecond*100)
 	}
-	results, _ := kinesisSvc.PutRecords(&kinesis.PutRecordsInput{
+	results, err := kinesisSvc.PutRecords(&kinesis.PutRecordsInput{
 		Records:    records,
 		StreamName: kinesisStream,
 	})
 
+	if err != nil {
+		return err
+	}
+
 	var backOff = time.Second
-	var err error
 	for ; *results.FailedRecordCount != 0 ; {
 		_, output = tm.Value()
 		fmt.Printf("Some records (%d/%d) failed: %s retrying in %f seconds (%s)\n", *results.FailedRecordCount, len(records), err, backOff.Seconds(), output)
@@ -82,9 +85,10 @@ func sendRecords(kinesisSvc *kinesis.Kinesis, records []*kinesis.PutRecordsReque
 			StreamName: kinesisStream,
 		})
 		if err != nil {
-			fmt.Println(err)
+			return err
 		}
 	}
+	return nil
 }
 
 // Partition list of log events into lists of of logevents, each holding at maximum bytes
@@ -202,9 +206,9 @@ func main() {
 			})
 		}
 
-		var records []*kinesis.PutRecordsRequestEntry
 		for stream, streamEvents := range eventsByStream {
 			for i, events := range splitLogEvents(streamEvents, 600000) {
+				var records []*kinesis.PutRecordsRequestEntry
 				fmt.Println("Publishing to stream", stream, "batch #", i, "items", len(events))
 				record := Record{
 					Owner:               accountID,
@@ -239,7 +243,11 @@ func main() {
 					PartitionKey: &stream,
 				})
 
-				sendRecords(kinesisSvc, records, kinesisStream, &tm)
+				err = sendRecords(kinesisSvc, records, kinesisStream, &tm)
+				if err != nil {
+					fmt.Println(err)
+					return false
+				}
 			}
 		}
 		return true
